@@ -1,12 +1,14 @@
 """
 benchmark_indexes.py
 ====================
-Запуск:
-    pip install numpy scikit-learn
+Compare four index structures on 1M integer keys.
+
+Usage:
+    pip install numpy scikit-learn   # or: uv add numpy scikit-learn
     python benchmark_indexes.py
 
-Результат:
-    Таблица в терминале + файл results/benchmark_results.txt
+Output:
+    Results table printed to stdout + saved to results/benchmark_results.txt
 """
 
 import bisect
@@ -18,11 +20,12 @@ from sklearn.tree import DecisionTreeRegressor
 
 
 # ══════════════════════════════════════════════════════
-#  СТРУКТУРЫ ИНДЕКСИРОВАНИЯ
+#  INDEX STRUCTURES
 # ══════════════════════════════════════════════════════
 
 class BinarySearchIndex:
-    """Сортированный массив + бинарный поиск — аналог B-Tree lookup."""
+    """Sorted array + binary search. Equivalent to B-Tree point lookup."""
+
     def __init__(self, keys):
         self.keys = np.array(sorted(keys), dtype=np.int64)
         self.mae = None
@@ -39,7 +42,12 @@ class BinarySearchIndex:
 
 
 class LinearLearnedIndex:
-    """Линейная регрессия как аппроксимация CDF. Поиск за O(1) + уточнение."""
+    """
+    Linear regression as CDF approximation.
+    Predicts position in O(1), then refines with local binary search
+    in the window [pred - max_err, pred + max_err].
+    """
+
     def __init__(self, keys):
         self.keys = np.array(sorted(keys), dtype=np.int64)
         n = len(self.keys)
@@ -62,24 +70,34 @@ class LinearLearnedIndex:
         return -1
 
     def size_bytes(self):
-        return 16  # два float64: коэффициент a и смещение b
+        # Two float64 values: slope (a) and intercept (b)
+        return 16
 
 
 class TwoLevelRMI:
-    """Двухуровневый Recursive Model Index: 1 глобальная + N локальных моделей."""
+    """
+    Two-level Recursive Model Index.
+    Level 1: one global linear model that selects a bucket.
+    Level 2: N local linear models that predict exact position.
+    Reference: Kraska et al., SIGMOD 2018.
+    """
+
     def __init__(self, keys, n_models=100):
         self.keys = np.array(sorted(keys), dtype=np.int64)
         n = len(self.keys)
         self.n_models = n_models
         positions = np.arange(n, dtype=np.float64)
 
+        # Level 1: global model
         self.l1 = LinearRegression().fit(self.keys.reshape(-1, 1), positions)
 
+        # Assign keys to buckets based on level-1 predictions
         bucket_ids = np.clip(
             (self.l1.predict(self.keys.reshape(-1, 1)) * n_models / n).astype(int),
             0, n_models - 1
         )
 
+        # Level 2: one local model per bucket
         self.l2, self.max_errs = [], []
         for b in range(n_models):
             mask = bucket_ids == b
@@ -94,6 +112,7 @@ class TwoLevelRMI:
             self.l2.append(m)
             self.max_errs.append(int(np.abs(preds - positions[mask].astype(int)).max()))
 
+        # Compute overall MAE
         all_preds = []
         for key in self.keys:
             b = int(np.clip(self.l1.predict([[key]])[0] * n_models / n, 0, n_models - 1))
@@ -122,11 +141,16 @@ class TwoLevelRMI:
         return -1
 
     def size_bytes(self):
+        # Level 1: 16 bytes; Level 2: n_models * 16 bytes
         return 16 + self.n_models * 16
 
 
 class DTLearnedIndex:
-    """Дерево решений как кусочно-постоянная аппроксимация CDF."""
+    """
+    Decision Tree Regressor as a piecewise-constant CDF approximation.
+    Each leaf covers a key range and stores a position estimate.
+    """
+
     def __init__(self, keys, max_depth=12):
         self.keys = np.array(sorted(keys), dtype=np.int64)
         n = len(self.keys)
@@ -154,13 +178,15 @@ class DTLearnedIndex:
 
 
 # ══════════════════════════════════════════════════════
-#  ЗАМЕР ПРОИЗВОДИТЕЛЬНОСТИ
+#  BENCHMARK RUNNER
 # ══════════════════════════════════════════════════════
 
 def run_benchmark(index, queries, name):
-    for k in queries[:1000]:          # прогрев кэша
+    # Warm up the CPU cache
+    for k in queries[:1000]:
         index.lookup(int(k))
 
+    # Main measurement loop
     latencies = []
     hits = 0
     for k in queries:
@@ -180,20 +206,20 @@ def run_benchmark(index, queries, name):
 
     line = (
         f"  {name:<30} | "
-        f"median={median_us:6.3f} мкс | "
-        f"p99={p99_us:7.2f} мкс | "
+        f"median={median_us:6.3f} us | "
+        f"p99={p99_us:7.2f} us | "
         f"hits={hits}/{len(queries)} | "
         f"MAE={str(mae):<10} | "
         f"MaxErr={str(max_err):<8} | "
-        f"size={size_kb:8.2f} КБ | "
-        f"tput={tput:6.0f} тыс.зап/с"
+        f"size={size_kb:8.2f} KB | "
+        f"tput={tput:6.0f} kqps"
     )
     print(line)
     return line
 
 
 # ══════════════════════════════════════════════════════
-#  ЗАПУСК
+#  ENTRY POINT
 # ══════════════════════════════════════════════════════
 
 def main():
@@ -212,13 +238,13 @@ def main():
     ]
 
     for dist_label, keys_gen in [
-        ("РАВНОМЕРНОЕ [0, 2^32)",
+        ("UNIFORM [0, 2^32)",
          lambda: np.sort(np.random.randint(0, 2**32, N, dtype=np.int64))),
-        ("НЕРАВНОМЕРНОЕ (Zipf, a=1.2)",
+        ("SKEWED (Zipf, a=1.2)",
          lambda: np.sort(np.random.zipf(1.2, N).cumsum().astype(np.int64))),
     ]:
         sep = "=" * 95
-        header = f"\n{sep}\n  Датасет: {N:,} ключей int64 | {dist_label}\n{sep}"
+        header = f"\n{sep}\n  Dataset: {N:,} int64 keys | {dist_label}\n{sep}"
         print(header)
         output_lines.append(header)
 
@@ -230,7 +256,7 @@ def main():
             idx = cls(keys, **kwargs)
             build_ms = (time.perf_counter() - t0) * 1000
 
-            build_line = f"  [build] {name}: {build_ms:.1f} мс"
+            build_line = f"  [build] {name}: {build_ms:.1f} ms"
             print(build_line)
             output_lines.append(build_line)
 
@@ -240,7 +266,7 @@ def main():
     result_path = "results/benchmark_results.txt"
     with open(result_path, "w", encoding="utf-8") as f:
         f.write("\n".join(output_lines))
-    print(f"\n✓ Результаты сохранены в {result_path}")
+    print(f"\nResults saved to {result_path}")
 
 
 if __name__ == "__main__":
