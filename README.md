@@ -86,3 +86,4 @@ Managed via [uv](https://github.com/astral-sh/uv). See `pyproject.toml`.
 | scikit-learn | ≥1.3 | LinearRegression, DecisionTreeRegressor |
 | matplotlib | ≥3.7 | Plot generation |
 | psycopg2-binary | ≥2.9 | PostgreSQL connection (optional) |
+
